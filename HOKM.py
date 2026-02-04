@@ -10,7 +10,7 @@ from aiogram.types import (
 )
 from aiogram.filters import Command
 
-TOKEN = os.getenv("8316915338:AAEo62io5KHBhq-MOMA-BRgSD9VleSDoRGc")
+TOKEN = os.getenv("BOT_TOKEN")
 
 bot = Bot(TOKEN)
 dp = Dispatcher()
@@ -175,4 +175,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-
