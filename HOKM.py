@@ -12,7 +12,7 @@ from flask import Flask, request
 
 # ==================== تنظیمات ====================
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "8316915338:AAEo62io5KHBhq-MOMA-BRgSD9VleSDoRGc")
-WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "")
+WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "https://hokmbot.onrender.com")
 
 # لاگ
 logging.basicConfig(
