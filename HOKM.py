@@ -5,6 +5,8 @@
 
 import os
 import logging
+import asyncio
+from threading import Thread
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
@@ -15,7 +17,7 @@ from telegram.ext import (
 from flask import Flask, request
 
 # ==================== تنظیمات ====================
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "8316915338:AAEo62io5KHBhq-MOMA-BRgSD9VleSDoRGc")
+BOT_TOKEN = "8316915338:AAEo62io5KHBhq-MOMA-BRgSD9VleSDoRGc"
 WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "https://hokmbot.onrender.com")
 PORT = int(os.environ.get('PORT', 10000))
 
@@ -341,19 +343,7 @@ async def main():
     await asyncio.Event().wait()
 
 if __name__ == '__main__':
-    import asyncio
-    
-    # بررسی توکن
-    if not BOT_TOKEN:
-        print("❌ خطا: BOT_TOKEN تنظیم نشده!")
-        print("در رندر Environment Variables تنظیم کنید:")
-        print("BOT_TOKEN = توکن_ربات_شما")
-        print("WEBHOOK_URL = آدرس_رندر_شما")
-        exit(1)
-    
     # اجرای Flask در background
-    from threading import Thread
-    
     def run_flask():
         app.run(host='0.0.0.0', port=PORT, debug=False, use_reloader=False)
     
