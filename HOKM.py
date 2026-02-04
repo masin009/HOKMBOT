@@ -654,7 +654,8 @@ class HokmBot:
 # ==================== تابع اصلی ====================
 def main():
     bot = HokmBot(BOT_TOKEN)
-    application = Application.builder().token(BOT_TOKEN).build()
+    application = Application.builder().token(BOT_TOKEN).arbitrary_callback_data(True).build()
+
     
     conv_handler = ConversationHandler(
         entry_points=[CommandHandler('newgame', bot.new_game)],
