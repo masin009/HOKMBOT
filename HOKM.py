@@ -1,25 +1,18 @@
 #!/usr/bin/env python3
 """
-ربات کامل بازی حکم - نسخه اصلاح شده برای رندر
+ربات کامل بازی حکم - با pyTelegramBotAPI
 """
 
 import os
 import logging
 import random
-from datetime import datetime
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import (
-    Updater,
-    CommandHandler,
-    CallbackQueryHandler,
-    ConversationHandler,
-    MessageHandler,
-    Filters,
-    CallbackContext,
-)
+import telebot
+from telebot import types
+from flask import Flask, request
 
 # ==================== تنظیمات ====================
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "8316915338:AAEo62io5KHBhq-MOMA-BRgSD9VleSDoRGc")
+WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "")
 
 # لاگ
 logging.basicConfig(
@@ -28,12 +21,14 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# وضعیت‌های مکالمه
-WAITING, PLAYING = range(2)
+# ==================== ربات ====================
+bot = telebot.TeleBot(BOT_TOKEN)
+app = Flask(__name__)
 
 # ==================== کلاس بازی ====================
 class HokmGame:
-    def __init__(self):
+    def __init__(self, chat_id):
+        self.chat_id = chat_id
         self.players = []
         self.deck = []
         self.hands = {}
@@ -41,6 +36,7 @@ class HokmGame:
         self.hakem = None
         self.current_player = 0
         self.scores = [0, 0]  # تیم ۱ و ۲
+        self.game_started = False
         self.create_deck()
     
     def create_deck(self):
@@ -64,245 +60,259 @@ class HokmGame:
     def get_player_cards(self, user_id):
         return self.hands.get(user_id, [])
 
-# ==================== ربات ====================
+# ذخیره بازی‌ها
 games = {}
 
-# دستور /start
-def start(update: Update, context: CallbackContext):
-    update.message.reply_text(
+# ==================== دستورات ====================
+@bot.message_handler(commands=['start'])
+def start(message):
+    bot.reply_to(message,
         "🎴 *ربات بازی حکم*\n\n"
         "دستورات:\n"
         "/newgame - شروع بازی جدید\n"
         "/join - پیوستن به بازی\n"
-        "/rules - قوانین بازی\n\n"
-        "برای شروع بازی در گروه، دستور /newgame را وارد کنید.",
+        "/rules - قوانین بازی\n"
+        "/help - راهنما\n\n"
+        "برای شروع، در یک گروه دستور /newgame را وارد کنید.",
         parse_mode='Markdown'
     )
 
-# دستور /newgame
-def new_game(update: Update, context: CallbackContext):
-    chat_id = update.effective_chat.id
-    user = update.effective_user
-    
-    if chat_id in games:
-        update.message.reply_text("⚠️ یک بازی در حال انجام است!")
-        return ConversationHandler.END
-    
-    # ایجاد بازی جدید
-    game = HokmGame()
-    game.add_player(user.id, user.first_name)
-    games[chat_id] = game
-    
-    keyboard = [[
-        InlineKeyboardButton("🎮 پیوستن به بازی", callback_data='join'),
-        InlineKeyboardButton("▶️ شروع بازی", callback_data='start_game')
-    ]]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    update.message.reply_text(
-        f"🎴 *بازی جدید ساخته شد!*\n\n"
-        f"بازیکن ۱: {user.first_name}\n"
-        f"۳ بازیکن دیگر نیاز است.\n\n"
-        "روی 'پیوستن به بازی' کلیک کنید.",
-        reply_markup=reply_markup,
-        parse_mode='Markdown'
-    )
-    
-    return WAITING
+@bot.message_handler(commands=['help'])
+def help_cmd(message):
+    help_text = """
+🆘 *راهنمای ربات*
 
-# پیوستن به بازی
-def join_game(update: Update, context: CallbackContext):
-    query = update.callback_query
-    query.answer()
-    
-    chat_id = update.effective_chat.id
-    user = update.effective_user
-    
-    if chat_id not in games:
-        query.edit_message_text("⚠️ بازی پیدا نشد!")
-        return
-    
-    game = games[chat_id]
-    
-    if len(game.players) >= 4:
-        query.answer("بازی پر شده است!", show_alert=True)
-        return
-    
-    if any(p['id'] == user.id for p in game.players):
-        query.answer("شما قبلاً در بازی هستید!", show_alert=True)
-        return
-    
-    # اضافه کردن بازیکن
-    game.add_player(user.id, user.first_name)
-    
-    # آپدیت پیام
-    players_list = "\n".join([f"{i+1}. {p['name']}" for i, p in enumerate(game.players)])
-    remaining = 4 - len(game.players)
-    
-    keyboard = [[InlineKeyboardButton("🎮 پیوستن به بازی", callback_data='join')]]
-    if len(game.players) == 4:
-        keyboard.append([InlineKeyboardButton("▶️ شروع بازی", callback_data='start_game')])
-    
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    query.edit_message_text(
-        f"🎴 *بازی حکم*\n\n"
-        f"بازیکنان:\n{players_list}\n\n"
-        f"{'✅ آماده شروع!' if remaining == 0 else f'📍 {remaining} بازیکن دیگر نیاز است.'}",
-        reply_markup=reply_markup,
-        parse_mode='Markdown'
-    )
+🎮 **شروع بازی:**
+1. در گروه `/newgame` را بفرستید
+2. بازیکنان دیگر روی دکمه 'پیوستن' کلیک کنند
+3. وقتی ۴ نفر شدند، روی 'شروع بازی' کلیک کنید
 
-# شروع بازی
-def start_game(update: Update, context: CallbackContext):
-    query = update.callback_query
-    query.answer()
-    
-    chat_id = update.effective_chat.id
-    
-    if chat_id not in games:
-        query.edit_message_text("⚠️ بازی پیدا نشد!")
-        return ConversationHandler.END
-    
-    game = games[chat_id]
-    
-    if len(game.players) < 4:
-        query.answer("هنوز بازیکنان کافی نیستند!", show_alert=True)
-        return WAITING
-    
-    # توزیع کارت‌ها
-    game.deal_cards()
-    
-    # انتخاب حکم (بازیکن اول)
-    game.hakem = game.players[0]
-    
-    # نمایش حکم
-    keyboard = [[
-        InlineKeyboardButton("♠️ پیک", callback_data='trump_♠️'),
-        InlineKeyboardButton("♥️ دل", callback_data='trump_♥️'),
-    ], [
-        InlineKeyboardButton("♦️ خشت", callback_data='trump_♦️'),
-        InlineKeyboardButton("♣️ گیشنیز", callback_data='trump_♣️'),
-    ]]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    query.edit_message_text(
-        f"🎴 *بازی شروع شد!*\n\n"
-        f"حکم: {game.hakem['name']}\n"
-        f"لطفاً رنگ حکم را انتخاب کنید:",
-        reply_markup=reply_markup,
-        parse_mode='Markdown'
-    )
-    
-    return PLAYING
+🎴 **در حین بازی:**
+- کارت‌ها به صورت خصوصی ارسال می‌شوند
+- باید همخون بازی کنید
+- بازی ۱۳ دست دارد
 
-# انتخاب حکم
-def choose_trump(update: Update, context: CallbackContext):
-    query = update.callback_query
-    query.answer()
-    
-    chat_id = update.effective_chat.id
-    trump = query.data.replace('trump_', '')
-    
-    if chat_id not in games:
-        return
-    
-    game = games[chat_id]
-    game.trump = trump
-    
-    # ارسال کارت‌ها به هر بازیکن
-    for player in game.players:
-        try:
-            cards = game.get_player_cards(player['id'])
-            cards_text = "\n".join([f"{suit} {value}" for suit, value in cards])
-            context.bot.send_message(
-                player['id'],
-                f"🎴 *کارت‌های شما:*\n\n{cards_text}\n\n"
-                f"حکم: {trump}\n"
-                f"نوبت: {game.players[0]['name']}",
-                parse_mode='Markdown'
-            )
-        except Exception as e:
-            logger.error(f"خطا در ارسال کارت به {player['id']}: {e}")
-    
-    query.edit_message_text(
-        f"✅ *رنگ حکم انتخاب شد:* {trump}\n\n"
-        f"کارت‌ها توزیع شدند. بازی شروع می‌شود...",
-        parse_mode='Markdown'
-    )
-    
-    return PLAYING
+📊 **دستورات:**
+`/newgame` - بازی جدید
+`/rules` - قوانین
+`/help` - این راهنما
+    """
+    bot.reply_to(message, help_text, parse_mode='Markdown')
 
-# قوانین بازی
-def rules(update: Update, context: CallbackContext):
+@bot.message_handler(commands=['rules'])
+def rules(message):
     rules_text = """
 📋 *قوانین بازی حکم*
 
-🎴 تعداد بازیکنان: ۴ نفر (۲ تیم دو نفره)
-🎴 تعداد کارت‌ها: ۵۲ کارت
-🎴 توزیع کارت: هر بازیکن ۱۳ کارت
+🎴 **تعداد بازیکنان:** ۴ نفر (۲ تیم دو نفره)
+🎴 **تعداد کارت‌ها:** ۵۲ کارت
+🎴 **توزیع کارت:** هر بازیکن ۱۳ کارت
 
-🏆 هدف: کسب ۷ امتیاز قبل از تیم حریف
+🏆 **هدف:** کسب ۷ امتیاز قبل از تیم حریف
 
-🔄 مراحل:
+🔄 **مراحل:**
 ۱. انتخاب حکم (کارت ۷ دل)
 ۲. انتخاب رنگ حکم
-۳. شروع بازی
+۳. شروع بازی از سمت راست حکم
 ۴. بازی ۱۳ دست
 
-📌 قوانین:
+📌 **قوانین بازی:**
 - باید همخون بازی کنید
-- اگر همخون ندارید، حکم بزنید
-- اگر حکم ندارید، هر کارتی می‌توانید
+- اگر همخون ندارید، می‌توانید حکم بزنید
+- اگر حکم هم ندارید، هر کارتی می‌توانید
 
-🤝 تیم‌بندی:
-بازیکنان روبه‌رو تیمی هستند
+🎯 **امتیازدهی:**
+- برنده هر دست ۱ امتیاز می‌گیرد
+- تیم اولی که به ۷ امتیاز برسد برنده است
+
+🤝 **تیم‌بندی:**
+بازیکنان ۱ و ۳ تیم ۱
+بازیکنان ۲ و ۴ تیم ۲
     """
-    update.message.reply_text(rules_text, parse_mode='Markdown')
+    bot.reply_to(message, rules_text, parse_mode='Markdown')
 
-# لغو بازی
-def cancel(update: Update, context: CallbackContext):
-    query = update.callback_query
-    query.answer()
+@bot.message_handler(commands=['newgame'])
+def new_game(message):
+    chat_id = message.chat.id
+    user = message.from_user
     
-    chat_id = update.effective_chat.id
     if chat_id in games:
-        del games[chat_id]
+        bot.reply_to(message, "⚠️ یک بازی در حال انجام است!")
+        return
     
-    query.edit_message_text("❌ بازی لغو شد.")
-    return ConversationHandler.END
-
-# ==================== اصلی ====================
-def main():
-    # ساخت updater
-    updater = Updater(BOT_TOKEN, use_context=True)
-    dp = updater.dispatcher
+    # ایجاد بازی جدید
+    game = HokmGame(chat_id)
+    game.add_player(user.id, user.first_name)
+    games[chat_id] = game
     
-    # مکالمه
-    conv_handler = ConversationHandler(
-        entry_points=[CommandHandler('newgame', new_game)],
-        states={
-            WAITING: [
-                CallbackQueryHandler(join_game, pattern='^join$'),
-                CallbackQueryHandler(start_game, pattern='^start_game$'),
-            ],
-            PLAYING: [
-                CallbackQueryHandler(choose_trump, pattern='^trump_'),
-            ],
-        },
-        fallbacks=[CommandHandler('cancel', cancel)]
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    btn1 = types.InlineKeyboardButton("🎮 پیوستن به بازی", callback_data='join_game')
+    btn2 = types.InlineKeyboardButton("▶️ شروع بازی", callback_data='start_game')
+    btn3 = types.InlineKeyboardButton("❌ لغو بازی", callback_data='cancel_game')
+    markup.add(btn1, btn2, btn3)
+    
+    bot.reply_to(message,
+        f"🎴 *بازی جدید حکم ساخته شد!*\n\n"
+        f"بازیکن ۱: {user.first_name}\n"
+        f"📍 ۳ بازیکن دیگر نیاز است.\n\n"
+        "روی دکمه 'پیوستن به بازی' کلیک کنید.",
+        reply_markup=markup,
+        parse_mode='Markdown'
     )
-    
-    # اضافه کردن هندلرها
-    dp.add_handler(conv_handler)
-    dp.add_handler(CommandHandler('start', start))
-    dp.add_handler(CommandHandler('rules', rules))
-    dp.add_handler(CommandHandler('join', join_game))
-    
-    # شروع ربات
-    print("🤖 ربات حکم در حال اجرا...")
-    updater.start_polling()
-    updater.idle()
 
+@bot.callback_query_handler(func=lambda call: True)
+def handle_callback(call):
+    chat_id = call.message.chat.id
+    user = call.from_user
+    
+    if call.data == 'join_game':
+        if chat_id not in games:
+            bot.answer_callback_query(call.id, "بازی پیدا نشد!")
+            return
+        
+        game = games[chat_id]
+        
+        if len(game.players) >= 4:
+            bot.answer_callback_query(call.id, "بازی پر شده است!")
+            return
+        
+        if any(p['id'] == user.id for p in game.players):
+            bot.answer_callback_query(call.id, "شما قبلاً در بازی هستید!")
+            return
+        
+        # اضافه کردن بازیکن
+        game.add_player(user.id, user.first_name)
+        
+        # آپدیت پیام
+        players_list = "\n".join([f"{i+1}. {p['name']}" for i, p in enumerate(game.players)])
+        remaining = 4 - len(game.players)
+        
+        markup = types.InlineKeyboardMarkup(row_width=2)
+        btn1 = types.InlineKeyboardButton("🎮 پیوستن به بازی", callback_data='join_game')
+        btn2 = types.InlineKeyboardButton("▶️ شروع بازی", callback_data='start_game')
+        btn3 = types.InlineKeyboardButton("❌ لغو بازی", callback_data='cancel_game')
+        
+        if remaining == 0:
+            markup.add(btn2, btn3)
+        else:
+            markup.add(btn1, btn2, btn3)
+        
+        bot.edit_message_text(
+            f"🎴 *بازی حکم*\n\n"
+            f"بازیکنان:\n{players_list}\n\n"
+            f"{'✅ آماده شروع!' if remaining == 0 else f'📍 {remaining} بازیکن دیگر نیاز است.'}",
+            chat_id=chat_id,
+            message_id=call.message.message_id,
+            reply_markup=markup,
+            parse_mode='Markdown'
+        )
+        bot.answer_callback_query(call.id, "شما به بازی پیوستید!")
+    
+    elif call.data == 'start_game':
+        if chat_id not in games:
+            bot.answer_callback_query(call.id, "بازی پیدا نشد!")
+            return
+        
+        game = games[chat_id]
+        
+        if len(game.players) < 4:
+            bot.answer_callback_query(call.id, "هنوز بازیکنان کافی نیستند!", show_alert=True)
+            return
+        
+        # شروع بازی
+        game.game_started = True
+        game.deal_cards()
+        game.hakem = game.players[0]
+        
+        markup = types.InlineKeyboardMarkup(row_width=2)
+        btn1 = types.InlineKeyboardButton("♠️ پیک", callback_data='trump_♠️')
+        btn2 = types.InlineKeyboardButton("♥️ دل", callback_data='trump_♥️')
+        btn3 = types.InlineKeyboardButton("♦️ خشت", callback_data='trump_♦️')
+        btn4 = types.InlineKeyboardButton("♣️ گیشنیز", callback_data='trump_♣️')
+        markup.add(btn1, btn2, btn3, btn4)
+        
+        bot.edit_message_text(
+            f"🎴 *بازی شروع شد!*\n\n"
+            f"حکم: {game.hakem['name']}\n"
+            f"لطفاً رنگ حکم را انتخاب کنید:",
+            chat_id=chat_id,
+            message_id=call.message.message_id,
+            reply_markup=markup,
+            parse_mode='Markdown'
+        )
+        bot.answer_callback_query(call.id)
+    
+    elif call.data.startswith('trump_'):
+        if chat_id not in games:
+            return
+        
+        game = games[chat_id]
+        trump = call.data.replace('trump_', '')
+        game.trump = trump
+        
+        # ارسال کارت‌ها به هر بازیکن
+        for player in game.players:
+            try:
+                cards = game.get_player_cards(player['id'])
+                if cards:
+                    cards_text = "\n".join([f"{suit} {value}" for suit, value in cards])
+                    bot.send_message(
+                        player['id'],
+                        f"🎴 *کارت‌های شما:*\n\n{cards_text}\n\n"
+                        f"*حکم:* {trump}\n"
+                        f"*نوبت:* {game.players[0]['name']}",
+                        parse_mode='Markdown'
+                    )
+            except Exception as e:
+                logger.error(f"خطا در ارسال کارت به {player['id']}: {e}")
+        
+        bot.edit_message_text(
+            f"✅ *رنگ حکم انتخاب شد:* {trump}\n\n"
+            f"کارت‌ها توزیع شدند. بازی شروع می‌شود...\n\n"
+            f"برای ادامه، کارت‌های خود را بررسی کنید.",
+            chat_id=chat_id,
+            message_id=call.message.message_id,
+            parse_mode='Markdown'
+        )
+        bot.answer_callback_query(call.id, f"حکم: {trump}")
+    
+    elif call.data == 'cancel_game':
+        if chat_id in games:
+            del games[chat_id]
+        
+        bot.edit_message_text(
+            "❌ بازی لغو شد.",
+            chat_id=chat_id,
+            message_id=call.message.message_id
+        )
+        bot.answer_callback_query(call.id)
+
+@bot.message_handler(commands=['join'])
+def join_cmd(message):
+    bot.reply_to(message, "لطفاً روی دکمه 'پیوستن به بازی' در پیام بازی کلیک کنید.")
+
+# ==================== Flask برای رندر ====================
+@app.route('/')
+def index():
+    return "🤖 ربات حکم در حال اجرا است!"
+
+@app.route('/' + BOT_TOKEN, methods=['POST'])
+def webhook():
+    if request.headers.get('content-type') == 'application/json':
+        json_string = request.get_data().decode('utf-8')
+        update = telebot.types.Update.de_json(json_string)
+        bot.process_new_updates([update])
+        return ''
+    return 'OK'
+
+# ==================== اجرا ====================
 if __name__ == '__main__':
-    main()
+    if WEBHOOK_URL:
+        # حالت وب‌هوک برای رندر
+        bot.remove_webhook()
+        bot.set_webhook(url=WEBHOOK_URL + '/' + BOT_TOKEN)
+        app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 10000)))
+    else:
+        # حالت polling برای تست محلی
+        print("🤖 ربات حکم در حال اجرا (Polling)...")
+        bot.infinity_polling()
