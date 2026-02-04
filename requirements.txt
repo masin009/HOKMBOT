@@ -1,2 +1,2 @@
-python-telegram-bot[job-queue]==21.0
-Flask==3.0.0
+python-telegram-bot==13.15
+flask==2.3.3
