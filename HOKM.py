@@ -1,496 +1,927 @@
-"""
-Hokm Game Bot - Optimized for Render.com
-"""
+# requirements.txt
+# python-telegram-bot==20.7
+# python-dotenv==1.0.0
+# Pillow==10.0.0
 
 import os
-import logging
 import random
-from typing import Dict, List, Optional, Tuple
+import logging
+from enum import Enum
+from datetime import datetime
+from typing import Dict, List, Tuple, Optional, Set
+from dataclasses import dataclass, field
 from collections import defaultdict
-from uuid import uuid4
+import asyncio
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
-from telegram.constants import ParseMode
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    CallbackQueryHandler,
+    ContextTypes,
+    ConversationHandler,
+    MessageHandler,
+    filters
+)
+from dotenv import load_dotenv
 
-# ============ CONFIG ============
-BOT_TOKEN = os.getenv("BOT_TOKEN")
+# بارگذاری متغیرهای محیطی
+load_dotenv()
 
-# برای Render
-if not BOT_TOKEN:
-    BOT_TOKEN = "8316915338:AAEo62io5KHBhq-MOMA-BRgSD9VleSDoRGc"  # در Render از محیطی می‌گیرد
+# تنظیمات لاگ
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
 
-# ============ GAME LOGIC ============
-SUITS = ['hearts', 'diamonds', 'clubs', 'spades']
-SUIT_SYMBOLS = {'hearts': '❤️', 'diamonds': '♦️', 'clubs': '♣️', 'spades': '♠️'}
-RANKS = ['2', '3', '4', '5', '6', '7', '8', '9', '10', 'J', 'Q', 'K', 'A']
-RANK_VALUES = {rank: i+2 for i, rank in enumerate(RANKS)}
+# توکن ربات (از محیط یا فایل .env بخوانید)
+TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 
+# حالت‌های مکالمه
+class ConversationStates(Enum):
+    WAITING_FOR_PLAYERS = 1
+    IN_GAME = 2
+    CHOOSING_TRUMP = 3
+    PLAYING_CARD = 4
+
+# خال‌های کارت
+class Suit(Enum):
+    HEARTS = "♥"      # دل
+    DIAMONDS = "♦"    # خشت
+    CLUBS = "♣"       # پیک
+    SPADES = "♠"      # گیشنیز
+    
+    @property
+    def persian_name(self):
+        names = {
+            Suit.HEARTS: "دل",
+            Suit.DIAMONDS: "خشت",
+            Suit.CLUBS: "پیک",
+            Suit.SPADES: "گیشنیز"
+        }
+        return names[self]
+
+# رتبه‌های کارت
+class Rank(Enum):
+    TWO = ("2", 2)
+    THREE = ("3", 3)
+    FOUR = ("4", 4)
+    FIVE = ("5", 5)
+    SIX = ("6", 6)
+    SEVEN = ("7", 7)
+    EIGHT = ("8", 8)
+    NINE = ("9", 9)
+    TEN = ("10", 10)
+    JACK = ("J", 11)
+    QUEEN = ("Q", 12)
+    KING = ("K", 13)
+    ACE = ("A", 14)
+    
+    def __init__(self, symbol, value):
+        self.symbol = symbol
+        self.value = value
+
+# کارت
+@dataclass
 class Card:
-    def __init__(self, suit: str, rank: str):
-        self.suit = suit
-        self.rank = rank
-        self.value = RANK_VALUES[rank]
+    suit: Suit
+    rank: Rank
     
     def __str__(self):
-        return f"{SUIT_SYMBOLS[self.suit]}{self.rank}"
+        return f"{self.suit.value}{self.rank.symbol}"
+    
+    def __repr__(self):
+        return str(self)
+    
+    @property
+    def persian_name(self):
+        rank_names = {
+            Rank.ACE: "آس",
+            Rank.KING: "شاه",
+            Rank.QUEEN: "بی‌بی",
+            Rank.JACK: "سرباز",
+            Rank.TEN: "۱۰",
+            Rank.NINE: "۹",
+            Rank.EIGHT: "۸",
+            Rank.SEVEN: "۷",
+            Rank.SIX: "۶",
+            Rank.FIVE: "۵",
+            Rank.FOUR: "۴",
+            Rank.THREE: "۳",
+            Rank.TWO: "۲"
+        }
+        return f"{rank_names[self.rank]} {self.suit.persian_name}"
 
+# بازیکن
+@dataclass
 class Player:
-    def __init__(self, user_id: int, name: str):
-        self.user_id = user_id
-        self.name = name
-        self.cards: List[Card] = []
-        self.team = 0
-        self.tricks_won = 0
-        self.is_ready = False
+    user_id: int
+    username: str
+    first_name: str
+    cards: List[Card] = field(default_factory=list)
+    score: int = 0
+    tricks_won: int = 0
+    is_ready: bool = False
     
-    def add_card(self, card: Card):
-        self.cards.append(card)
+    def __hash__(self):
+        return hash(self.user_id)
     
-    def remove_card(self, suit: str, rank: str) -> bool:
-        for i, card in enumerate(self.cards):
-            if card.suit == suit and card.rank == rank:
-                del self.cards[i]
+    @property
+    def display_name(self):
+        if self.username:
+            return f"@{self.username}"
+        return self.first_name
+
+# دست بازی (Round)
+@dataclass
+class Round:
+    cards_played: Dict[int, Card] = field(default_factory=dict)  # user_id -> Card
+    starting_player: Optional[int] = None
+    trump_suit: Optional[Suit] = None
+    winner: Optional[int] = None
+    
+    def is_complete(self, players: List[Player]) -> bool:
+        return len(self.cards_played) == len(players)
+    
+    def get_winning_player(self, players: List[Player]) -> Optional[int]:
+        if not self.is_complete(players):
+            return None
+        
+        # اولین کارت را پیدا کن
+        first_player_id = self.starting_player
+        first_card = self.cards_played[first_player_id]
+        leading_suit = first_card.suit
+        
+        # برنده را پیدا کن (با در نظر گرفتن خال حکم)
+        winning_player_id = first_player_id
+        winning_card = first_card
+        
+        for player_id, card in self.cards_played.items():
+            # اگر کارت خال حکم دارد
+            if card.suit == self.trump_suit and winning_card.suit != self.trump_suit:
+                winning_player_id = player_id
+                winning_card = card
+            # اگر هر دو خال حکم دارند
+            elif card.suit == self.trump_suit and winning_card.suit == self.trump_suit:
+                if card.rank.value > winning_card.rank.value:
+                    winning_player_id = player_id
+                    winning_card = card
+            # اگر هر دو خال معمولی دارند
+            elif card.suit == leading_suit and winning_card.suit == leading_suit:
+                if card.rank.value > winning_card.rank.value:
+                    winning_player_id = player_id
+                    winning_card = card
+        
+        return winning_player_id
+
+# بازی
+@dataclass
+class Game:
+    game_id: str
+    chat_id: int
+    players: List[Player] = field(default_factory=list)
+    deck: List[Card] = field(default_factory=list)
+    current_round: Round = field(default_factory=Round)
+    rounds: List[Round] = field(default_factory=list)
+    turn_order: List[int] = field(default_factory=list)  # user_id ها به ترتیب
+    current_turn_index: int = 0
+    dealer_index: int = 0
+    trump_suit: Optional[Suit] = None
+    trump_chooser: Optional[int] = None
+    state: str = "waiting"  # waiting, choosing_trump, playing, finished
+    created_at: datetime = field(default_factory=datetime.now)
+    messages_to_delete: List[int] = field(default_factory=list)
+    
+    def add_player(self, player: Player) -> bool:
+        if len(self.players) >= 4:
+            return False
+        if any(p.user_id == player.user_id for p in self.players):
+            return False
+        self.players.append(player)
+        return True
+    
+    def remove_player(self, user_id: int) -> bool:
+        for i, player in enumerate(self.players):
+            if player.user_id == user_id:
+                self.players.pop(i)
                 return True
         return False
     
-    def has_suit(self, suit: str) -> bool:
-        return any(card.suit == suit for card in self.cards)
-
-class Game:
-    def __init__(self, game_id: str, creator_id: int):
-        self.game_id = game_id
-        self.players: Dict[int, Player] = {}
-        self.player_order: List[int] = []
-        self.phase = "waiting"  # waiting, choosing_trump, playing, ended
-        self.trump_suit: Optional[str] = None
-        self.dealer_index = 0
-        self.current_player_index = 0
-        self.current_trick: List[Tuple[int, Card]] = []
-        self.scores = {0: 0, 1: 0}
-        self.round = 1
+    def initialize_deck(self):
+        self.deck = []
+        for suit in Suit:
+            for rank in Rank:
+                self.deck.append(Card(suit, rank))
+        random.shuffle(self.deck)
     
-    @property
-    def current_player_id(self) -> Optional[int]:
-        if not self.player_order:
-            return None
-        return self.player_order[self.current_player_index]
-    
-    @property
-    def player_count(self):
-        return len(self.players)
-    
-    def add_player(self, player: Player):
-        if self.player_count >= 4:
-            return False
-        self.players[player.user_id] = player
-        self.player_order.append(player.user_id)
-        player.team = (self.player_count - 1) % 2
-        return True
-    
-    def remove_player(self, user_id: int):
-        if user_id in self.players:
-            del self.players[user_id]
-            self.player_order.remove(user_id)
-            return True
-        return False
+    def deal_cards(self):
+        # به هر بازیکن 13 کارت بده
+        for i, player in enumerate(self.players):
+            start = i * 13
+            end = start + 13
+            player.cards = self.deck[start:end]
+            # کارت‌ها را بر اساس خال و ارزش مرتب کن
+            player.cards.sort(key=lambda c: (c.suit.value, c.rank.value))
     
     def start_game(self):
-        if self.player_count != 4:
+        self.initialize_deck()
+        self.deal_cards()
+        self.turn_order = [p.user_id for p in self.players]
+        self.current_turn_index = 0
+        self.state = "choosing_trump"
+        
+        # تعیین بازیکنی که باید خال حکم را انتخاب کند
+        self.trump_chooser = self.turn_order[0]
+    
+    def choose_trump(self, user_id: int, suit: Suit) -> bool:
+        if self.state != "choosing_trump" or user_id != self.trump_chooser:
             return False
         
-        # Create and shuffle deck
-        deck = [Card(suit, rank) for suit in SUITS for rank in RANKS]
-        random.shuffle(deck)
-        
-        # Deal 13 cards to each player
-        for i in range(13):
-            for player_id in self.player_order:
-                if deck:
-                    self.players[player_id].add_card(deck.pop())
-        
-        # Set initial dealer
-        self.dealer_index = random.randint(0, 3)
-        self.current_player_index = (self.dealer_index + 1) % 4
-        self.phase = "choosing_trump"
+        self.trump_suit = suit
+        self.current_round.trump_suit = suit
+        self.state = "playing"
         return True
-
-# ============ BOT HANDLERS ============
-games: Dict[str, Game] = {}
-user_games: Dict[int, str] = {}
-
-def get_user_game(user_id: int) -> Optional[Game]:
-    game_id = user_games.get(user_id)
-    return games.get(game_id) if game_id else None
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    keyboard = [
-        [InlineKeyboardButton("🎮 بازی جدید", callback_data="new_game")],
-        [InlineKeyboardButton("📖 آموزش بازی", callback_data="tutorial")]
-    ]
     
-    await update.message.reply_text(
-        "🤖 به ربات بازی حکم خوش آمدید!\n\n"
-        "🎯 یک بازی کارتی ۴ نفره با قوانین کامل حکم\n\n"
-        "برای شروع روی «بازی جدید» کلیک کنید.",
-        reply_markup=InlineKeyboardMarkup(keyboard),
-        parse_mode=ParseMode.HTML
-    )
-
-async def new_game(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    
-    user = query.from_user
-    
-    # Check if user already in a game
-    if user.id in user_games:
-        await query.edit_message_text(
-            "⚠️ شما در حال حاضر در یک بازی هستید!\n"
-            "برای خروج از /leave استفاده کنید."
-        )
-        return
-    
-    # Create new game
-    game_id = str(uuid4())[:6].upper()
-    game = Game(game_id, user.id)
-    game.add_player(Player(user.id, user.first_name))
-    
-    games[game_id] = game
-    user_games[user.id] = game_id
-    
-    # Create waiting room
-    players_text = "\n".join([
-        f"{i+1}. 👤 {game.players[pid].name}" 
-        for i, pid in enumerate(game.player_order)
-    ])
-    
-    message = (
-        f"🎮 <b>اتاق بازی جدید</b>\n\n"
-        f"🆔 کد بازی: <code>{game_id}</code>\n\n"
-        f"👥 بازیکنان:\n{players_text}\n\n"
-        f"📝 برای دعوت دوستان، کد بالا را بفرستید."
-    )
-    
-    keyboard = [
-        [InlineKeyboardButton("✅ من آماده‌ام", callback_data=f"ready_{game_id}")],
-        [InlineKeyboardButton("🔄 وضعیت", callback_data=f"status_{game_id}")],
-        [InlineKeyboardButton("❌ خروج", callback_data=f"leave_{game_id}")]
-    ]
-    
-    await query.edit_message_text(
-        message,
-        parse_mode=ParseMode.HTML,
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
-
-async def join_game(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    
-    await query.edit_message_text(
-        "🔍 برای پیوستن به بازی، کد بازی را وارد کنید:\n\n"
-        "مثال: <code>/join ABC123</code>",
-        parse_mode=ParseMode.HTML
-    )
-
-async def join_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text(
-            "⚠️ لطفاً کد بازی را وارد کنید:\n"
-            "<code>/join ABC123</code>",
-            parse_mode=ParseMode.HTML
-        )
-        return
-    
-    game_id = context.args[0].upper()
-    user = update.effective_user
-    
-    if user.id in user_games:
-        await update.message.reply_text("⚠️ شما در حال حاضر در بازی‌ای هستید!")
-        return
-    
-    if game_id not in games:
-        await update.message.reply_text("⚠️ بازی یافت نشد!")
-        return
-    
-    game = games[game_id]
-    if game.player_count >= 4:
-        await update.message.reply_text("⚠️ بازی تکمیل است!")
-        return
-    
-    # Add player
-    game.add_player(Player(user.id, user.first_name))
-    user_games[user.id] = game_id
-    
-    # Notify all players
-    for player_id in game.player_order:
-        try:
-            players_list = "\n".join([
-                f"{i+1}. 👤 {game.players[pid].name}" 
-                for i, pid in enumerate(game.player_order)
-            ])
+    def play_card(self, user_id: int, card_index: int) -> Optional[Card]:
+        # بررسی نوبت
+        if self.state != "playing":
+            return None
+        
+        current_player_id = self.turn_order[self.current_turn_index]
+        if user_id != current_player_id:
+            return None
+        
+        # پیدا کردن بازیکن
+        player = next((p for p in self.players if p.user_id == user_id), None)
+        if not player or card_index >= len(player.cards):
+            return None
+        
+        # بیرون آوردن کارت از دست بازیکن
+        card = player.cards.pop(card_index)
+        
+        # اگر اولین کارت دست است، بازیکن شروع‌کننده را تنظیم کن
+        if len(self.current_round.cards_played) == 0:
+            self.current_round.starting_player = user_id
+        
+        # کارت را به دست اضافه کن
+        self.current_round.cards_played[user_id] = card
+        
+        # نوبت را به بازیکن بعدی بده
+        self.current_turn_index = (self.current_turn_index + 1) % len(self.players)
+        
+        # اگر دست کامل شد، برنده را تعیین کن
+        if self.current_round.is_complete(self.players):
+            winner_id = self.current_round.get_winning_player(self.players)
+            self.current_round.winner = winner_id
             
+            # برنده دست بعدی را شروع می‌کند
+            winner_index = self.turn_order.index(winner_id)
+            self.current_turn_index = winner_index
+            
+            # این دست را به تاریخچه اضافه کن
+            self.rounds.append(self.current_round)
+            
+            # دست جدید شروع کن
+            self.current_round = Round()
+            self.current_round.trump_suit = self.trump_suit
+            
+            # اگر بازی تمام شده (کارت‌ها تمام شده)
+            if all(len(p.cards) == 0 for p in self.players):
+                self.state = "finished"
+        
+        return card
+    
+    def get_player_by_id(self, user_id: int) -> Optional[Player]:
+        for player in self.players:
+            if player.user_id == user_id:
+                return player
+        return None
+
+# مدیریت بازی‌های فعال
+class GameManager:
+    def __init__(self):
+        self.active_games: Dict[int, Game] = {}  # chat_id -> Game
+        self.player_games: Dict[int, int] = {}   # user_id -> chat_id
+    
+    def create_game(self, chat_id: int) -> Game:
+        game_id = f"game_{chat_id}_{datetime.now().timestamp()}"
+        game = Game(game_id=game_id, chat_id=chat_id)
+        self.active_games[chat_id] = game
+        return game
+    
+    def get_game(self, chat_id: int) -> Optional[Game]:
+        return self.active_games.get(chat_id)
+    
+    def end_game(self, chat_id: int):
+        if chat_id in self.active_games:
+            # حذف رکوردهای بازیکنان
+            game = self.active_games[chat_id]
+            for player in game.players:
+                if player.user_id in self.player_games:
+                    del self.player_games[player.user_id]
+            del self.active_games[chat_id]
+    
+    def register_player(self, user_id: int, chat_id: int):
+        self.player_games[user_id] = chat_id
+    
+    def get_player_game(self, user_id: int) -> Optional[Game]:
+        chat_id = self.player_games.get(user_id)
+        if chat_id:
+            return self.get_game(chat_id)
+        return None
+
+# ایجاد مدیر بازی
+game_manager = GameManager()
+
+# دستورات ربات
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """دستور شروع ربات"""
+    user = update.effective_user
+    await update.message.reply_text(
+        f"سلام {user.first_name}! 👋\n\n"
+        "به ربات بازی پاسور (حکم) خوش آمدید! 🃏\n\n"
+        "برای شروع یک بازی جدید در گروه، از دستور /newgame استفاده کنید.\n"
+        "برای پیوستن به بازی از /join استفاده کنید.\n"
+        "برای شروع بازی از /startgame استفاده کنید.\n\n"
+        "📖 قوانین بازی:\n"
+        "• بازی ۴ نفره است\n"
+        "• هر بازیکن ۱۳ کارت دریافت می‌کند\n"
+        "• یک خال به عنوان خال حکم انتخاب می‌شود\n"
+        "• هر دست توسط بازیکنی شروع می‌شود و بقیه باید همخال بیاورند\n"
+        "• اگر همخال نداشته باشند، می‌توانند هر کارتی بگذارند\n"
+        "• برنده دست، کسی است که بالاترین کارت خال حکم را آورده باشد\n"
+        "• امتیاز بر اساس تعداد بردها (دست‌ها) محاسبه می‌شود"
+    )
+
+async def new_game_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """ایجاد یک بازی جدید"""
+    chat_id = update.effective_chat.id
+    
+    # بررسی اینکه آیا بازی فعالی در این چت وجود دارد
+    existing_game = game_manager.get_game(chat_id)
+    if existing_game and existing_game.state != "finished":
+        await update.message.reply_text(
+            "⚠️ در این گروه یک بازی در حال اجرا وجود دارد. "
+            "برای شروع بازی جدید باید بازی قبلی تمام شود."
+        )
+        return
+    
+    # ایجاد بازی جدید
+    game = game_manager.create_game(chat_id)
+    
+    # اضافه کردن سازنده بازی به عنوان اولین بازیکن
+    user = update.effective_user
+    player = Player(
+        user_id=user.id,
+        username=user.username,
+        first_name=user.first_name
+    )
+    game.add_player(player)
+    game_manager.register_player(user.id, chat_id)
+    
+    # ایجاد دکمه‌های شیشه‌ای
+    keyboard = [
+        [InlineKeyboardButton("🎮 پیوستن به بازی", callback_data="join_game")],
+        [InlineKeyboardButton("▶️ شروع بازی", callback_data="start_game")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    message = await update.message.reply_text(
+        "🎉 یک بازی جدید پاسور (حکم) ایجاد شد!\n\n"
+        f"بازیکنان ({len(game.players)}/4):\n" +
+        "\n".join([f"• {p.display_name}" for p in game.players]) +
+        "\n\nبرای پیوستن به بازی روی دکمه زیر کلیک کنید:",
+        reply_markup=reply_markup
+    )
+    
+    # ذخیره ID پیام برای به روزرسانی بعدی
+    game.messages_to_delete.append(message.message_id)
+
+async def join_game_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """پیوستن به بازی از طریق دکمه"""
+    query = update.callback_query
+    await query.answer()
+    
+    user = update.effective_user
+    chat_id = update.effective_chat.id
+    
+    game = game_manager.get_game(chat_id)
+    if not game:
+        await query.edit_message_text("❌ بازی یافت نشد. لطفا یک بازی جدید ایجاد کنید.")
+        return
+    
+    if game.state != "waiting":
+        await query.edit_message_text("❌ بازی در حال اجراست. نمی‌توانید الان بپیوندید.")
+        return
+    
+    # بررسی اینکه آیا بازیکن قبلا پیوسته
+    if any(p.user_id == user.id for p in game.players):
+        await query.edit_message_text("✅ شما قبلا به بازی پیوسته‌اید!")
+        return
+    
+    # بررسی تعداد بازیکنان
+    if len(game.players) >= 4:
+        await query.edit_message_text("❌ بازی تکمیل است. حداکثر ۴ بازیکن مجاز است.")
+        return
+    
+    # اضافه کردن بازیکن جدید
+    player = Player(
+        user_id=user.id,
+        username=user.username,
+        first_name=user.first_name
+    )
+    game.add_player(player)
+    game_manager.register_player(user.id, chat_id)
+    
+    # به روزرسانی پیام
+    keyboard = [
+        [InlineKeyboardButton("🎮 پیوستن به بازی", callback_data="join_game")],
+        [InlineKeyboardButton("▶️ شروع بازی", callback_data="start_game")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await query.edit_message_text(
+        f"🎮 بازی پاسور (حکم)\n\n"
+        f"بازیکنان ({len(game.players)}/4):\n" +
+        "\n".join([f"• {p.display_name}" for p in game.players]) +
+        "\n\nبرای پیوستن به بازی روی دکمه زیر کلیک کنید:",
+        reply_markup=reply_markup
+    )
+
+async def start_game_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """شروع بازی"""
+    query = update.callback_query
+    await query.answer()
+    
+    chat_id = update.effective_chat.id
+    game = game_manager.get_game(chat_id)
+    
+    if not game:
+        await query.edit_message_text("❌ بازی یافت نشد.")
+        return
+    
+    if len(game.players) < 2:
+        await query.edit_message_text("❌ حداقل ۲ بازیکن برای شروع بازی لازم است.")
+        return
+    
+    # شروع بازی
+    game.start_game()
+    
+    # حذف پیام قبلی
+    await query.delete_message()
+    
+    # ارسال پیام شروع بازی
+    start_message = await context.bot.send_message(
+        chat_id,
+        "🎉 بازی شروع شد!\n\n"
+        f"بازیکنان: {', '.join([p.display_name for p in game.players])}\n"
+        f"تعداد دست‌ها: {len(game.rounds) + 1}/13\n\n"
+        f"🃏 خال حکم: در حال انتخاب..."
+    )
+    
+    # نمایش کارت‌های بازیکن شروع کننده (کسی که باید خال حکم را انتخاب کند)
+    trump_chooser = game.get_player_by_id(game.trump_chooser)
+    if trump_chooser:
+        # ایجاد دکمه‌های انتخاب خال حکم
+        keyboard = [
+            [
+                InlineKeyboardButton(f"♥ دل", callback_data="trump_hearts"),
+                InlineKeyboardButton(f"♦ خشت", callback_data="trump_diamonds")
+            ],
+            [
+                InlineKeyboardButton(f"♣ پیک", callback_data="trump_clubs"),
+                InlineKeyboardButton(f"♠ گیشنیز", callback_data="trump_spades")
+            ]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        chooser_message = await context.bot.send_message(
+            chat_id,
+            f"👑 {trump_chooser.display_name}، لطفا خال حکم را انتخاب کنید:",
+            reply_markup=reply_markup
+        )
+        
+        game.messages_to_delete.append(chooser_message.message_id)
+    
+    game.messages_to_delete.append(start_message.message_id)
+
+async def choose_trump_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """انتخاب خال حکم"""
+    query = update.callback_query
+    await query.answer()
+    
+    user = update.effective_user
+    chat_id = update.effective_chat.id
+    
+    game = game_manager.get_game(chat_id)
+    if not game or game.state != "choosing_trump":
+        await query.edit_message_text("❌ بازی در مرحله انتخاب خال حکم نیست.")
+        return
+    
+    # بررسی اینکه آیا کاربر مجاز به انتخاب خال حکم است
+    if user.id != game.trump_chooser:
+        await query.answer("شما نوبت انتخاب خال حکم را ندارید!", show_alert=True)
+        return
+    
+    # شناسایی خال انتخاب شده
+    trump_map = {
+        "trump_hearts": Suit.HEARTS,
+        "trump_diamonds": Suit.DIAMONDS,
+        "trump_clubs": Suit.CLUBS,
+        "trump_spades": Suit.SPADES
+    }
+    
+    chosen_trump = trump_map.get(query.data)
+    if not chosen_trump:
+        await query.edit_message_text("❌ انتخاب نامعتبر.")
+        return
+    
+    # ثبت انتخاب خال حکم
+    game.choose_trump(user.id, chosen_trump)
+    
+    # به روزرسانی پیام
+    await query.edit_message_text(
+        f"✅ خال حکم انتخاب شد: {chosen_trump.value} {chosen_trump.persian_name}\n\n"
+        f"اولین دست را {game.players[0].display_name} شروع می‌کند."
+    )
+    
+    # شروع اولین دست
+    await play_round(context, chat_id)
+
+async def play_round(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
+    """مدیریت بازی یک دست"""
+    game = game_manager.get_game(chat_id)
+    if not game:
+        return
+    
+    # پاک کردن پیام‌های قبلی
+    for msg_id in game.messages_to_delete:
+        try:
+            await context.bot.delete_message(chat_id, msg_id)
+        except:
+            pass
+    game.messages_to_delete.clear()
+    
+    # اگر بازی تمام شده
+    if game.state == "finished":
+        await end_game(context, chat_id)
+        return
+    
+    # بازیکن نوبت
+    current_player_id = game.turn_order[game.current_turn_index]
+    current_player = game.get_player_by_id(current_player_id)
+    
+    # ایجاد نمایش وضعیت بازی
+    status_message = await create_game_status(context, chat_id)
+    game.messages_to_delete.append(status_message.message_id)
+    
+    # اگر نوبت کاربری است که با ربات در حال تعامل است
+    if current_player:
+        # نمایش کارت‌های بازیکن
+        await show_player_cards(context, chat_id, current_player_id)
+
+async def create_game_status(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
+    """ایجاد پیام وضعیت بازی"""
+    game = game_manager.get_game(chat_id)
+    if not game:
+        return None
+    
+    # اطلاعات دست فعلی
+    round_info = ""
+    if game.current_round.cards_played:
+        round_info = "\n🎴 کارت‌های بازی شده در این دست:\n"
+        for player_id, card in game.current_round.cards_played.items():
+            player = game.get_player_by_id(player_id)
+            round_info += f"• {player.display_name}: {card.persian_name}\n"
+    
+    # بازیکن نوبت
+    current_player_id = game.turn_order[game.current_turn_index]
+    current_player = game.get_player_by_id(current_player_id)
+    
+    status_text = (
+        f"🎮 بازی پاسور (حکم)\n\n"
+        f"🃏 خال حکم: {game.trump_suit.value} {game.trump_suit.persian_name}\n"
+        f"👤 نوبت: {current_player.display_name}\n"
+        f"📊 دست‌های برداشته شده:\n"
+    )
+    
+    # اضافه کردن اطلاعات دست‌های برداشته شده
+    for player in game.players:
+        status_text += f"• {player.display_name}: {player.tricks_won} دست\n"
+    
+    status_text += round_info
+    status_text += f"\n♻️ دست: {len(game.rounds) + 1}/13"
+    
+    return await context.bot.send_message(chat_id, status_text)
+
+async def show_player_cards(context: ContextTypes.DEFAULT_TYPE, chat_id: int, user_id: int):
+    """نمایش کارت‌های بازیکن"""
+    game = game_manager.get_game(chat_id)
+    if not game:
+        return
+    
+    player = game.get_player_by_id(user_id)
+    if not player:
+        return
+    
+    # گروه‌بندی کارت‌ها بر اساس خال
+    cards_by_suit = defaultdict(list)
+    for i, card in enumerate(player.cards):
+        cards_by_suit[card.suit].append((i, card))
+    
+    # ایجاد دکمه‌های کارت
+    keyboard = []
+    for suit in Suit:
+        row = []
+        for card_index, card in cards_by_suit.get(suit, []):
+            # رنگ‌بندی دکمه‌ها بر اساس خال
+            emoji = "♥️" if suit == Suit.HEARTS else "♦️" if suit == Suit.DIAMONDS else "♣️" if suit == Suit.CLUBS else "♠️"
+            button_text = f"{emoji} {card.rank.symbol}"
+            row.append(InlineKeyboardButton(button_text, callback_data=f"play_card_{card_index}"))
+        
+        if row:
+            keyboard.append(row)
+    
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    # ارسال پیام به بازیکن
+    try:
+        message = await context.bot.send_message(
+            user_id,
+            f"🎴 کارت‌های شما:\n\n"
+            f"خال حکم: {game.trump_suit.value} {game.trump_suit.persian_name}\n\n"
+            f"یک کارت برای بازی انتخاب کنید:",
+            reply_markup=reply_markup
+        )
+        game.messages_to_delete.append(message.message_id)
+    except Exception as e:
+        # اگر نتوانستیم پیام خصوصی بفرستیم، در گروه اعلام می‌کنیم
+        await context.bot.send_message(
+            chat_id,
+            f"⚠️ {player.display_name}، لطفا ابتدا به ربات پیام خصوصی بفرستید: @{context.bot.username}"
+        )
+
+async def play_card_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """بازی کردن یک کارت"""
+    query = update.callback_query
+    await query.answer()
+    
+    user = update.effective_user
+    game = game_manager.get_player_game(user.id)
+    
+    if not game:
+        await query.edit_message_text("❌ شما در بازی فعالی نیستید.")
+        return
+    
+    # استخراج اندیس کارت
+    card_index = int(query.data.split("_")[-1])
+    
+    # بازی کردن کارت
+    played_card = game.play_card(user.id, card_index)
+    
+    if not played_card:
+        await query.answer("❌ نمی‌توانید این کارت را بازی کنید!", show_alert=True)
+        return
+    
+    # به روزرسانی پیام کارت‌ها
+    await query.edit_message_text(
+        f"✅ کارت بازی شد: {played_card.persian_name}\n\n"
+        f"در حال انتظار برای بازیکنان دیگر..."
+    )
+    
+    # بررسی اینکه آیا دست کامل شده
+    if game.current_round.is_complete(game.players):
+        # پیدا کردن برنده دست
+        winner_id = game.current_round.winner
+        winner = game.get_player_by_id(winner_id)
+        
+        if winner:
+            winner.tricks_won += 1
+            
+            # اعلام برنده دست
             await context.bot.send_message(
-                player_id,
-                f"🎉 {user.first_name} به بازی پیوست!\n\n"
-                f"👥 بازیکنان:\n{players_list}\n\n"
-                f"🆔 کد بازی: <code>{game_id}</code>",
-                parse_mode=ParseMode.HTML
+                game.chat_id,
+                f"🏆 برنده این دست: {winner.display_name}\n"
+                f"با کارت: {game.current_round.cards_played[winner_id].persian_name}\n\n"
+                f"دست بعدی را {winner.display_name} شروع می‌کند."
             )
+    
+    # ادامه بازی
+    await play_round(context, game.chat_id)
+
+async def end_game(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
+    """پایان بازی و نمایش نتایج"""
+    game = game_manager.get_game(chat_id)
+    if not game:
+        return
+    
+    # پیدا کردن برنده (کسی که بیشترین دست را برده)
+    winner = max(game.players, key=lambda p: p.tricks_won)
+    
+    # ایجاد متن نتایج
+    results_text = "🎊 بازی به پایان رسید! 🎊\n\nنتایج نهایی:\n\n"
+    
+    for player in sorted(game.players, key=lambda p: p.tricks_won, reverse=True):
+        trophy = "🏆" if player == winner else "🎯"
+        results_text += f"{trophy} {player.display_name}: {player.tricks_won} دست\n"
+    
+    results_text += f"\n🎉 برنده بازی: {winner.display_name} 🎉"
+    
+    # ارسال نتایج
+    await context.bot.send_message(chat_id, results_text)
+    
+    # پاک کردن پیام‌های بازی
+    for msg_id in game.messages_to_delete:
+        try:
+            await context.bot.delete_message(chat_id, msg_id)
         except:
             pass
     
-    await update.message.reply_text(f"✅ به بازی {game_id} پیوستید!")
+    # پایان بازی
+    game_manager.end_game(chat_id)
 
-async def ready_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    
-    user_id = query.from_user.id
-    game_id = query.data.split('_')[1]
-    
-    if game_id not in games or user_id not in games[game_id].players:
-        await query.edit_message_text("⚠️ بازی یافت نشد!")
-        return
-    
-    game = games[game_id]
-    player = game.players[user_id]
-    player.is_ready = not player.is_ready
-    
-    # Count ready players
-    ready_count = sum(1 for p in game.players.values() if p.is_ready)
-    
-    # Update message
-    players_text = "\n".join([
-        f"{i+1}. {'✅' if game.players[pid].is_ready else '⏳'} {game.players[pid].name}" 
-        for i, pid in enumerate(game.player_order)
-    ])
-    
-    message = (
-        f"🎮 <b>اتاق بازی {game_id}</b>\n\n"
-        f"👥 بازیکنان ({ready_count}/4 آماده):\n{players_text}\n\n"
-        f"{'🎯 همه آماده هستند! سازنده می‌تواند بازی را شروع کند.' if ready_count == 4 else '⏳ منتظر آماده شدن بقیه...'}"
+async def rules_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """نمایش قوانین بازی"""
+    rules_text = (
+        "📖 قوانین بازی پاسور (حکم):\n\n"
+        "🎯 هدف بازی:\n"
+        "بردیدن بیشترین تعداد دست (تریک) در هر دور بازی\n\n"
+        "👥 تعداد بازیکنان:\n"
+        "۴ نفر\n\n"
+        "🃏 نحوه بازی:\n"
+        "۱. هر بازیکن ۱۳ کارت دریافت می‌کند\n"
+        "۲. یک خال به عنوان خال حکم انتخاب می‌شود\n"
+        "۳. اولین بازیکن یک کارت بازی می‌کند\n"
+        "۴. بازیکنان بعدی باید اگر بتوانند همخال بیاورند\n"
+        "۵. اگر همخال نداشته باشند، می‌توانند هر کارتی بگذارند\n"
+        "۶. برنده دست، کسی است که بالاترین کارت خال حکم را آورده باشد\n"
+        "۷. اگر کسی خال حکم نیاورده باشد، برنده کسی است که بالاترین کارت خال اول را آورده باشد\n"
+        "۸. برنده دست بعدی را شروع می‌کند\n\n"
+        "🏆 امتیازدهی:\n"
+        "• هر دست برده شده = ۱ امتیاز\n"
+        "• برنده بازی: کسی که بیشترین امتیاز را داشته باشد\n\n"
+        "💡 نکات:\n"
+        "• کارت‌ها از کم به زیاد: ۲, ۳, ۴, ۵, ۶, ۷, ۸, ۹, ۱۰, سرباز, بی‌بی, شاه, آس\n"
+        "• خال حکم از همه خال‌ها قوی‌تر است\n"
+        "• باید حتما همخال آورد مگر اینکه اصلا همخال نداشته باشید"
     )
     
-    keyboard = [
-        [InlineKeyboardButton("✅ من آماده‌ام", callback_data=f"ready_{game_id}")],
-        [InlineKeyboardButton("🔄 وضعیت", callback_data=f"status_{game_id}")]
-    ]
-    
-    if user_id == game.creator_id and ready_count == 4:
-        keyboard.append([InlineKeyboardButton("▶️ شروع بازی", callback_data=f"start_{game_id}")])
-    
-    keyboard.append([InlineKeyboardButton("❌ خروج", callback_data=f"leave_{game_id}")])
-    
-    await query.edit_message_text(
-        message,
-        parse_mode=ParseMode.HTML,
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
+    await update.message.reply_text(rules_text)
 
-async def start_game_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
+async def leave_game_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """ترک بازی"""
+    user = update.effective_user
+    chat_id = update.effective_chat.id
     
-    user_id = query.from_user.id
-    game_id = query.data.split('_')[1]
-    
-    if game_id not in games or user_id != games[game_id].creator_id:
-        await query.edit_message_text("⚠️ فقط سازنده می‌تواند بازی را شروع کند!")
+    game = game_manager.get_game(chat_id)
+    if not game:
+        await update.message.reply_text("❌ بازی فعالی در این گروه وجود ندارد.")
         return
     
-    game = games[game_id]
-    
-    if game.player_count != 4:
-        await query.edit_message_text("⚠️ بازی باید ۴ بازیکن داشته باشد!")
+    if game.state != "waiting":
+        await update.message.reply_text("❌ بازی در حال اجراست. نمی‌توانید بازی را ترک کنید.")
         return
     
-    # Start the game
-    if not game.start_game():
-        await query.edit_message_text("⚠️ خطا در شروع بازی!")
-        return
-    
-    # Notify all players
-    for player_id in game.player_order:
-        player = game.players[player_id]
+    if game.remove_player(user.id):
+        await update.message.reply_text("✅ شما از بازی خارج شدید.")
         
-        # Show cards
-        cards_by_suit = defaultdict(list)
-        for card in player.cards:
-            cards_by_suit[card.suit].append(card)
-        
-        cards_text = ""
-        for suit in SUITS:
-            if suit in cards_by_suit:
-                cards_text += f"{SUIT_SYMBOLS[suit]}: "
-                cards_text += " ".join([card.rank for card in cards_by_suit[suit]]) + "\n"
-        
-        # Trump selection
-        if player_id == game.current_player_id:
-            keyboard = []
-            for suit in SUITS:
-                keyboard.append([
-                    InlineKeyboardButton(
-                        f"{SUIT_SYMBOLS[suit]} انتخاب حکم",
-                        callback_data=f"trump_{game_id}_{suit}"
-                    )
-                ])
-            
-            await context.bot.send_message(
-                player_id,
-                f"🎴 <b>کارت‌های شما:</b>\n\n{cards_text}\n\n"
-                f"🎯 شما باید حکم بازی را انتخاب کنید:",
-                parse_mode=ParseMode.HTML,
-                reply_markup=InlineKeyboardMarkup(keyboard)
-            )
-        else:
-            await context.bot.send_message(
-                player_id,
-                f"🎴 <b>کارت‌های شما:</b>\n\n{cards_text}\n\n"
-                f"⏳ منتظر انتخاب حکم توسط {game.players[game.current_player_id].name}...",
-                parse_mode=ParseMode.HTML
-            )
-
-async def leave_game(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    
-    user_id = query.from_user.id
-    game_id = query.data.split('_')[1] if '_' in query.data else None
-    
-    if not game_id:
-        game = get_user_game(user_id)
-        game_id = user_games.get(user_id)
+        # اگر بازیکنی باقی نمانده، بازی را پایان بده
+        if len(game.players) == 0:
+            game_manager.end_game(chat_id)
+            await update.message.reply_text("🔄 بازی به دلیل عدم وجود بازیکن لغو شد.")
     else:
-        game = games.get(game_id)
+        await update.message.reply_text("❌ شما در این بازی عضو نیستید.")
+
+async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """نمایش وضعیت فعلی بازی"""
+    chat_id = update.effective_chat.id
     
-    if not game or user_id not in game.players:
-        await query.edit_message_text("⚠️ شما در بازی‌ای نیستید!")
+    game = game_manager.get_game(chat_id)
+    if not game:
+        await update.message.reply_text("📭 در حال حاضر هیچ بازی فعالی در این گروه وجود ندارد.")
         return
     
-    player_name = game.players[user_id].name
-    
-    # Remove player
-    game.remove_player(user_id)
-    if user_id in user_games:
-        del user_games[user_id]
-    
-    # Remove empty game
-    if game.player_count == 0:
-        if game_id in games:
-            del games[game_id]
-    
-    # Notify others
-    if game.player_count > 0:
-        for pid in game.player_order:
-            try:
-                await context.bot.send_message(
-                    pid,
-                    f"👋 {player_name} از بازی خارج شد.\n"
-                    f"👥 {game.player_count}/4 بازیکن باقی‌مانده.",
-                    parse_mode=ParseMode.HTML
-                )
-            except:
-                pass
-    
-    await query.edit_message_text(
-        "✅ شما از بازی خارج شدید.",
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("🎮 منوی اصلی", callback_data="main_menu")]
-        ])
-    )
+    if game.state == "waiting":
+        players_text = "\n".join([f"• {p.display_name}" for p in game.players])
+        await update.message.reply_text(
+            f"⏳ بازی در انتظار بازیکنان...\n\n"
+            f"بازیکنان ({len(game.players)}/4):\n{players_text}\n\n"
+            f"برای پیوستن به بازی از /join استفاده کنید."
+        )
+    else:
+        # نمایش وضعیت بازی در حال اجرا
+        status_text = (
+            f"🎮 بازی در حال اجرا\n\n"
+            f"بازیکنان: {', '.join([p.display_name for p in game.players])}\n"
+            f"خال حکم: {game.trump_suit.value if game.trump_suit else 'در حال انتخاب'}\n"
+            f"تعداد دست‌ها: {len(game.rounds)}/13\n"
+            f"وضعیت: {'در حال انتخاب خال حکم' if game.state == 'choosing_trump' else 'در حال بازی'}\n\n"
+        )
+        
+        # نمایش برنده هر دور
+        if game.rounds:
+            status_text += "نتایج دست‌های قبلی:\n"
+            for i, round in enumerate(game.rounds, 1):
+                winner = game.get_player_by_id(round.winner) if round.winner else None
+                if winner:
+                    status_text += f"دست {i}: {winner.display_name}\n"
+        
+        await update.message.reply_text(status_text)
 
-async def main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    
-    keyboard = [
-        [InlineKeyboardButton("🎮 بازی جدید", callback_data="new_game")],
-        [InlineKeyboardButton("📖 آموزش بازی", callback_data="tutorial")]
-    ]
-    
-    await query.edit_message_text(
-        "🎮 <b>منوی اصلی ربات حکم</b>\n\n"
-        "برای شروع بازی جدید کلیک کنید:",
-        parse_mode=ParseMode.HTML,
-        reply_markup=InlineKeyboardMarkup(keyboard)
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """نمایش راهنمای دستورات"""
+    help_text = (
+        "📋 راهنمای دستورات ربات پاسور:\n\n"
+        "🔹 /start - شروع ربات و نمایش خوش‌آمد\n"
+        "🔹 /newgame - ایجاد یک بازی جدید\n"
+        "🔹 /join - پیوستن به بازی در انتظار\n"
+        "🔹 /startgame - شروع بازی با بازیکنان حاضر\n"
+        "🔹 /leave - ترک بازی (قبل از شروع)\n"
+        "🔹 /status - نمایش وضعیت فعلی بازی\n"
+        "🔹 /rules - نمایش قوانین بازی\n"
+        "🔹 /help - نمایش این راهنما\n"
+        "🔹 /cancel - لغو بازی فعلی\n\n"
+        "🎮 نحوه بازی:\n"
+        "۱. با /newgame یک بازی جدید ایجاد کنید\n"
+        "۲. بازیکنان با /join به بازی می‌پیوندند\n"
+        "۳. با /startgame بازی را شروع کنید\n"
+        "۴. خال حکم انتخاب می‌شود\n"
+        "۵. بازی کارت به کارت پیش می‌رود\n"
+        "۶. پس از ۱۳ دست، برنده اعلام می‌شود\n\n"
+        "💡 نکته: برای بازی نیاز است که به ربات پیام خصوصی بفرستید."
     )
+    
+    await update.message.reply_text(help_text)
 
-async def tutorial(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
+async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """لغو بازی فعلی"""
+    chat_id = update.effective_chat.id
+    user = update.effective_user
     
-    tutorial_text = (
-        "📖 <b>آموزش بازی حکم:</b>\n\n"
-        "🎯 یک بازی ۴ نفره با ۵۲ کارت\n\n"
-        "👥 <b>تیم‌بندی:</b>\n"
-        "• ۲ تیم دو نفره\n"
-        "• بازیکنان روبه‌رو هم‌تیمی\n\n"
-        "🎴 <b>مراحل:</b>\n"
-        "۱. انتخاب حکم (ترامپ)\n"
-        "۲. پخش ۱۳ کارت به هرکس\n"
-        "۳. بازی ۱۳ دست\n"
-        "۴. تیم با حداقل ۷ برد برنده\n\n"
-        "⚖️ <b>قوانین:</b>\n"
-        "• باید هم‌خال بازی کنید\n"
-        "• اگر خال نداشتید، هرکارتی\n"
-        "• خال حکم از همه قوی‌تر\n"
-        "• نوبت ساعتگرد\n\n"
-        "🎮 برای شروع: بازی جدید ← کد را بده ← شروع بازی"
-    )
+    game = game_manager.get_game(chat_id)
+    if not game:
+        await update.message.reply_text("❌ بازی فعالی برای لغو وجود ندارد.")
+        return
     
-    await query.edit_message_text(
-        tutorial_text,
-        parse_mode=ParseMode.HTML,
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("🔙 بازگشت", callback_data="main_menu")]
-        ])
-    )
+    # فقط سازنده بازی یا ادمین‌ها می‌توانند بازی را لغو کنند
+    # در این پیاده‌سازی ساده، همه می‌توانند لغو کنند
+    game_manager.end_game(chat_id)
+    
+    # پاک کردن پیام‌های بازی
+    for msg_id in game.messages_to_delete:
+        try:
+            await context.bot.delete_message(chat_id, msg_id)
+        except:
+            pass
+    
+    await update.message.reply_text("🔄 بازی فعلی لغو شد.")
 
-async def unknown_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "⚠️ دستور نامعتبر!\n\n"
-        "📋 دستورات موجود:\n"
-        "/start - راه‌اندازی\n"
-        "/new - بازی جدید\n"
-        "/join [کد] - پیوستن\n"
-        "/leave - خروج\n"
-        "/help - راهنما"
-    )
+async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """مدیریت خطاها"""
+    logger.error(f"خطا رخ داد: {context.error}")
+    
+    try:
+        # اطلاع به کاربر در صورت امکان
+        if update and update.effective_chat:
+            await context.bot.send_message(
+                update.effective_chat.id,
+                "⚠️ متاسفانه خطایی رخ داد. لطفا دوباره تلاش کنید."
+            )
+    except:
+        pass
 
-# ============ MAIN ============
 def main():
-    """Start the bot."""
-    # Create application
-    application = Application.builder().token(BOT_TOKEN).build()
+    """تابع اصلی برای اجرای ربات"""
+    # ایجاد برنامه ربات
+    application = Application.builder().token(TOKEN).build()
     
-    # Add handlers
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("new", start))  # Alias
-    application.add_handler(CommandHandler("join", join_command))
-    application.add_handler(CommandHandler("leave", lambda u,c: leave_game(u,c)))
-    application.add_handler(CommandHandler("help", tutorial))
+    # اضافه کردن هندلرهای دستورات
+    application.add_handler(CommandHandler("start", start_command))
+    application.add_handler(CommandHandler("newgame", new_game_command))
+    application.add_handler(CommandHandler("join", join_game_callback))
+    application.add_handler(CommandHandler("startgame", start_game_callback))
+    application.add_handler(CommandHandler("rules", rules_command))
+    application.add_handler(CommandHandler("leave", leave_game_command))
+    application.add_handler(CommandHandler("status", status_command))
+    application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("cancel", cancel_command))
     
-    # Callback handlers
-    application.add_handler(CallbackQueryHandler(new_game, pattern="^new_game$"))
-    application.add_handler(CallbackQueryHandler(join_game, pattern="^join_game$"))
-    application.add_handler(CallbackQueryHandler(ready_handler, pattern="^ready_"))
-    application.add_handler(CallbackQueryHandler(start_game_handler, pattern="^start_"))
-    application.add_handler(CallbackQueryHandler(leave_game, pattern="^leave_"))
-    application.add_handler(CallbackQueryHandler(main_menu, pattern="^main_menu$"))
-    application.add_handler(CallbackQueryHandler(tutorial, pattern="^tutorial$"))
+    # اضافه کردن هندلرهای callback
+    application.add_handler(CallbackQueryHandler(join_game_callback, pattern="^join_game$"))
+    application.add_handler(CallbackQueryHandler(start_game_callback, pattern="^start_game$"))
+    application.add_handler(CallbackQueryHandler(choose_trump_callback, pattern="^trump_"))
+    application.add_handler(CallbackQueryHandler(play_card_callback, pattern="^play_card_"))
     
-    # Unknown command handler
-    application.add_handler(MessageHandler(filters.COMMAND, unknown_command))
+    # اضافه کردن هندلر خطا
+    application.add_error_handler(error_handler)
     
-    # Start polling
-    print("🤖 ربات حکم راه‌اندازی شد...")
-    application.run_polling(drop_pending_updates=True)
+    # شروع ربات
+    print("🤖 ربات بازی پاسور (حکم) در حال اجراست...")
+    print(f"🔗 لینک ربات: https://t.me/{application.bot.username}")
+    print("🃏 برای شروع بازی در یک گروه از دستور /newgame استفاده کنید.")
+    
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
-    logging.basicConfig(
-        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-        level=logging.INFO
-    )
     main()
